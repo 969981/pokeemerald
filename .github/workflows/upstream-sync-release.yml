@@ -1,0 +1,172 @@
+name: Sync upstream and build releases
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [multi-language]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pokeemerald-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync pret/pokeemerald
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      master_changed: ${{ steps.sync.outputs.master_changed }}
+      multi_language_changed: ${{ steps.sync.outputs.multi_language_changed }}
+    steps:
+      - name: Checkout default branch with history
+        uses: actions/checkout@v4
+        with:
+          ref: multi-language
+          fetch-depth: 0
+
+      - name: Fast-forward master and merge multi-language
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/pret/pokeemerald.git
+          git fetch upstream master multi-language --no-tags
+          git fetch origin master multi-language --no-tags
+
+          master_changed=false
+          multi_language_changed=false
+
+          git checkout -B master refs/remotes/origin/master
+          if ! git merge-base --is-ancestor HEAD refs/remotes/upstream/master; then
+            echo 'master diverged from pret/master. Refusing to overwrite local commits.' >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse refs/remotes/upstream/master)" ]; then
+            git merge --ff-only refs/remotes/upstream/master
+            git push origin HEAD:refs/heads/master
+            master_changed=true
+          fi
+
+          git checkout -B multi-language refs/remotes/origin/multi-language
+          if ! git merge-base --is-ancestor refs/remotes/upstream/multi-language HEAD; then
+            # Preserve this automation and other local changes while incorporating upstream.
+            git merge --no-edit refs/remotes/upstream/multi-language
+            git push origin HEAD:refs/heads/multi-language
+            multi_language_changed=true
+          fi
+
+          echo "master_changed=$master_changed" >> "$GITHUB_OUTPUT"
+          echo "multi_language_changed=$multi_language_changed" >> "$GITHUB_OUTPUT"
+          echo "master changed: $master_changed"
+          echo "multi-language changed: $multi_language_changed"
+
+  build-release:
+    name: Build & release (${{ matrix.branch }})
+    needs: sync
+    if: >-
+      ${{ needs.sync.outputs.master_changed == 'true' || needs.sync.outputs.multi_language_changed == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [master, multi-language]
+    steps:
+      - name: Checkout synced branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+
+      - name: Check for existing release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tag="${TARGET}-${sha:0:12}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists; skipping compilation."
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout agbcc
+        if: steps.release.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: pret/agbcc
+          path: agbcc
+          persist-credentials: false
+
+      - name: Install compiler dependencies
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-arm-none-eabi binutils-arm-none-eabi libpng-dev
+
+      - name: Build and install agbcc
+        if: steps.release.outputs.exists == 'false'
+        working-directory: agbcc
+        run: |
+          ./build.sh
+          ./install.sh ../
+
+      - name: Build original-matching and modern ROMs
+        if: steps.release.outputs.exists == 'false'
+        env:
+          TARGET: ${{ matrix.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "$TARGET" = master ]; then
+            languages=(ENGLISH)
+          else
+            languages=(ENGLISH FRENCH ITALIAN SPANISH)
+          fi
+          for language in "${languages[@]}"; do
+            case "$language" in
+              ENGLISH) suffix='' ; code=en ;;
+              FRENCH)  suffix='_fr' ; code=fr ;;
+              ITALIAN) suffix='_it' ; code=it ;;
+              SPANISH) suffix='_es' ; code=es ;;
+            esac
+            make -j2 all "LANGUAGE=$language" MODERN=0 COMPARE=1
+            cp "pokeemerald${suffix}.gba" "dist/pokeemerald-${TARGET}-${code}-matching.gba"
+            make -j2 all "LANGUAGE=$language" MODERN=1 COMPARE=0
+            cp "pokeemerald${suffix}_modern.gba" "dist/pokeemerald-${TARGET}-${code}-modern.gba"
+          done
+          (cd dist && sha256sum ./*.gba > SHA256SUMS)
+
+      - name: Publish release assets
+        if: steps.release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ matrix.branch }}
+          name: pokeemerald ${{ matrix.branch }} @ ${{ steps.release.outputs.tag }}
+          body: |
+            Automated build from `969981/pokeemerald` `${{ matrix.branch }}`.
+            Source commit: `${{ steps.release.outputs.sha }}`.
+            Matching ROMs use agbcc (`MODERN=0`, `COMPARE=1`); modern ROMs use GCC (`MODERN=1`, `COMPARE=0`).
+            SHA256SUMS contains checksums for all included binaries.
+          files: |
+            dist/*.gba
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
